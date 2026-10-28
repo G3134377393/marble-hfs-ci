@@ -105,6 +105,13 @@ jobs:
                   echo 'NO dyld_shared_cache FILE FOUND IN THE CRYPTEX'; exit 1
                 fi
               fi
+              case "$d" in
+                *087-86715*|*087-86593*)
+                  echo "    merging cryptex volume $d"
+                  if [ -d "$CX/System" ]; then sudo rsync -a --ignore-existing "$CX/System/" "$HFSMP/System/"; fi
+                  if [ -d "$CX/usr" ];    then sudo rsync -a --ignore-existing "$CX/usr/"    "$HFSMP/usr/";    fi
+                  ;;
+              esac
               if [ -d "$CX/usr/lib" ]; then
                 sudo rsync -a --ignore-existing "$CX/usr/lib/" "$HFSMP/usr/lib/"
                 echo "    cryptex usr/lib merged"
@@ -121,6 +128,10 @@ jobs:
           sudo rm -rf "$HFSMP/private/preboot/System/Library/Caches/com.apple.dyld"
           sudo ln -s /System/Library/Caches/com.apple.dyld "$HFSMP/private/preboot/System/Library/Caches/com.apple.dyld"
           ls -l "$HFSMP/private/preboot/System/Library/Caches/" || true
+          echo 'MARK: step 1c1 - point /System/Cryptexes/App at the root volume'
+          sudo rm -rf "$HFSMP/System/Cryptexes/App"
+          sudo ln -s / "$HFSMP/System/Cryptexes/App"
+          ls -l "$HFSMP/System/Cryptexes/" || true
           echo 'MARK: step 1c2 - point /System/Cryptexes/OS at the root volume'
           sudo rm -f "$HFSMP/System/Cryptexes/OS"
           sudo ln -s / "$HFSMP/System/Cryptexes/OS"
@@ -137,6 +148,8 @@ jobs:
           sudo chmod -R 755 "$HFSMP/private/var" || true
           echo "  /private/var now has $(ls "$HFSMP/private/var" | wc -l) entries"
           ls "$HFSMP/private/var" | head -30
+          [ -d "$HFSMP/System/Library/PreferenceBundles" ] || { echo 'APPOS CONTENT MISSING (PreferenceBundles)'; exit 1; }
+          echo "  PreferenceBundles count: $(ls "$HFSMP/System/Library/PreferenceBundles" | wc -l)"
           [ -d "$HFSMP/private/var/keybags" ] || { echo 'keybags dir missing'; exit 1; }
           echo '  keybags directory present'
           echo 'MARK: step 1d2 - keybag placeholders and launchd disabled list'
@@ -304,7 +317,7 @@ jobs:
           GH_TOKEN: ${{ secrets.RELEASE_TOKEN }}
         run: |
           set -eux
-          TAG=ios-hfs-root26
+          TAG=ios-hfs-root27
           echo "TAG=$TAG"
           zstd -10 -T0 --long=27 -f hfs.img -o hfs.img.zst
           ls -la hfs.img.zst
