@@ -209,7 +209,7 @@ jobs:
       - name: fsck the volume (must be clean)
         run: |
           set -eux
-          hdiutil attach hfs.dmg -nobrowse >/dev/null
+          hdiutil attach -nomount hfs.dmg >/dev/null
           sleep 3
           DEV=$(hdiutil info | grep -oE '/dev/disk[0-9]+s[0-9]+' | tail -1)
           echo "device: $DEV"
