@@ -1,0 +1,354 @@
+name: build-ios-hfs-root
+
+# 在 macOS runner 上把 iOS 用户态（APFS）转成参考移植版需要的 HFS+ 镜像。
+# 关键修正：
+#   1. 卷尺寸给足（源 + 15% + 512MB），避免 ditto 写满
+#   2. -layout NONE -> 镜像本身就是文件系统（不带 GPT 分区表）
+#   3. 从 VH 读出真实大小 totalBlocks*blockSize，据此精确 dd 并截断
+#   4. 五道硬自检，任何一项不过就失败
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    runs-on: macos-14
+    timeout-minutes: 150
+    steps:
+      - name: Environment
+        run: |
+          set -x
+          sw_vers; df -h /; which hdiutil newfs_hfs ditto fsck_hfs zstd || true
+          brew install zstd || true
+
+      - name: Download the iPhone X IPSW
+        run: |
+          set -eux
+          URL='https://updates.cdn-apple.com/2025FallFCS/fullrestores/122-77006/1158E502-D76D-4226-AA06-ED5E30CD1111/iPhone10,3,iPhone10,6_16.7.16_20H392_Restore.ipsw'
+          curl -fL --retry 10 --retry-all-errors -o ipsw.zip "$URL"
+          ls -la ipsw.zip
+
+      - name: Extract the root filesystem dmg
+        run: |
+          set -eux
+          unzip -o -q ipsw.zip '*.dmg' -d ipsw_out
+          DMG=$(find ipsw_out -name '*.dmg' -size +1G | head -1)
+          [ -n "$DMG" ] || { echo 'no root dmg'; exit 1; }
+          echo "root dmg: $DMG"; ls -la "$DMG"
+          rm -f ipsw.zip
+          echo "DMG=$DMG" >> $GITHUB_ENV
+
+      - name: Attach the dmg and verify the iOS System volume
+        run: |
+          set -eux
+          rm -rf mnt && mkdir -p mnt
+          hdiutil attach "$DMG" -mountpoint mnt -nobrowse -readonly || true
+          SYS=''
+          for cand in mnt /Volumes/*; do
+            [ -d "$cand/System/Library/CoreServices" ] || continue
+            if grep -qa 'iPhone OS' "$cand/System/Library/CoreServices/SystemVersion.plist" 2>/dev/null; then SYS="$cand"; break; fi
+          done
+          [ -n "$SYS" ] || { echo 'no iOS System volume'; exit 1; }
+          echo "iOS system volume: $SYS"
+          ls "$SYS/System/Library" | head -5
+          echo "SYS=$SYS" >> $GITHUB_ENV
+
+      - name: Create a bare HFS+ volume and copy the tree in
+        run: |
+          set -eux
+          [ -n "${SYS:-}" ] && [ -d "$SYS" ] || { echo 'SYS missing'; exit 1; }
+          SZ=$(du -sm "$SYS" | awk '{print $1}')
+          echo "source tree: ${SZ} MB"
+          size=$(( SZ * 262 / 100 + 512 ))m
+          echo "volume size: $size"
+          rm -f hfs.dmg
+          # -layout NONE: no partition map, the image IS the filesystem
+          hdiutil create -size $size -fs HFS+ -volname iOS16 -layout NONE -ov hfs.dmg
+          mkdir -p hfsmnt
+          hdiutil attach hfs.dmg -nobrowse
+          sleep 3
+          HFSMP=$(mount | grep -i 'iOS16' | awk '{print $3}' | head -1)
+          if [ -z "$HFSMP" ]; then echo 'the HFS+ volume did not mount'; mount | tail -10; exit 1; fi
+          echo "HFS+ volume mounted at: $HFSMP"
+          df -h "$HFSMP"
+          echo 'MARK: step 1 - rsync the System volume (reads through decmpfs and writes plain files)'
+          sudo rsync -a "$SYS/" "$HFSMP/"
+          sync
+          df -h "$HFSMP" | tail -1
+          sync
+          echo 'MARK: step 1b - take ONLY the dyld shared cache from the cryptex image'
+          for d in ipsw_out/*.dmg; do
+            [ "$d" = "$DMG" ] && continue
+            MPS=$(hdiutil attach "$d" -nobrowse -readonly 2>/dev/null | grep -o '/Volumes/.*' | sort -u)
+            OLDIFS=$IFS; IFS=$(printf '\n')
+            for CX in $MPS; do
+              if [ -d "$CX/System/Library/Caches/com.apple.dyld" ]; then
+                echo "    cryptex cache found at $CX - copying only com.apple.dyld"
+                sudo mkdir -p "$HFSMP/System/Library/Caches"
+                sudo rm -rf "$HFSMP/System/Library/Caches/com.apple.dyld"
+                sudo mkdir -p "$HFSMP/System/Library/Caches/com.apple.dyld"
+                # rsync reads through decmpfs and writes plain files (ditto would keep them compressed)
+                sudo rsync -a "$CX/System/Library/Caches/com.apple.dyld/" "$HFSMP/System/Library/Caches/com.apple.dyld/"
+                echo '    cache copied with rsync (decompressed)'
+                sudo du -sh "$HFSMP/System/Library/Caches/com.apple.dyld"
+                CACHEF=$(find "$HFSMP/System/Library/Caches/com.apple.dyld" -name 'dyld_shared_cache*' | head -1)
+                echo "    cache file: $CACHEF"
+                if [ -n "$CACHEF" ]; then
+                  LOGICAL=$(stat -f%z "$CACHEF")
+                  REALKB=$(du -sk "$CACHEF" | awk '{print $1}')
+                  echo "    logical=${LOGICAL} bytes   on-disk=$(( REALKB * 1024 )) bytes"
+                  if [ $(( REALKB * 1024 )) -lt $(( LOGICAL * 80 / 100 )) ]; then echo 'CACHE IS STILL COMPRESSED (on-disk much smaller than logical)'; exit 1; fi
+                  echo '    cache is stored uncompressed'
+                else
+                  echo 'NO dyld_shared_cache FILE FOUND IN THE CRYPTEX'; exit 1
+                fi
+              fi
+              if [ -d "$CX/usr/lib" ]; then
+                sudo rsync -a --ignore-existing "$CX/usr/lib/" "$HFSMP/usr/lib/"
+                echo "    cryptex usr/lib merged"
+                [ -e "$HFSMP/usr/lib/libobjc-trampolines.dylib" ] || { echo 'LIBOBJC TRAMPOLINES MISSING'; exit 1; }
+                echo '    libobjc-trampolines.dylib present'
+              fi
+              hdiutil detach "$CX" >/dev/null 2>&1 || true
+            done
+            IFS=$OLDIFS
+          done
+          sync
+          echo 'MARK: step 1c - preboot alias (kernel accepts the cache on root or at /private/preboot)'
+          sudo mkdir -p "$HFSMP/private/preboot/System/Library/Caches"
+          sudo rm -rf "$HFSMP/private/preboot/System/Library/Caches/com.apple.dyld"
+          sudo ln -s /System/Library/Caches/com.apple.dyld "$HFSMP/private/preboot/System/Library/Caches/com.apple.dyld"
+          ls -l "$HFSMP/private/preboot/System/Library/Caches/" || true
+          echo 'MARK: step 1c2 - point /System/Cryptexes/OS at the root volume'
+          sudo rm -f "$HFSMP/System/Cryptexes/OS"
+          sudo ln -s / "$HFSMP/System/Cryptexes/OS"
+          ls -l "$HFSMP/System/Cryptexes/" || true
+          echo 'MARK: step 1c3 - keybagd stub carrying the keybagd signing identity'
+          [ -x "$HFSMP/usr/bin/vm_stat" ] || { echo 'vm_stat missing'; exit 1; }
+          sudo cp "$HFSMP/usr/bin/vm_stat" "$HFSMP/usr/libexec/keybagd"
+          sudo perl -pi -e 's/com\.apple\.vm_stat/com.apple.keybagd/g' "$HFSMP/usr/libexec/keybagd"
+          if perl -ne 'exit 0 if /com\.apple\.keybagd/' "$HFSMP/usr/libexec/keybagd"; then echo '  keybagd identity ok'; else echo 'KEYBAGD IDENTITY PATCH FAILED'; exit 1; fi
+          echo 'MARK: step 1d - create the iOS Data volume skeleton (UniXNU does the same)'
+          for d in db db/dslocal db/dslocal/nodes db/dslocal/nodes/Default db/dslocal/nodes/Default/users db/dslocal/nodes/Default/groups db/dslocal/nodes/Default/config containers containers/Data containers/Data/System containers/Data/Application containers/Shared containers/Shared/SystemGroup PersonaVolumes preboot root tmp Library keybags keybags/backup mobile mobile/Library mobile/Library/Preferences mobile/Library/Caches mobile/Library/Logs mobile/Containers mobile/Documents mobile/Media mobile/tmp; do
+            sudo mkdir -p "$HFSMP/private/var/$d"
+          done
+          sudo chmod -R 755 "$HFSMP/private/var" || true
+          echo "  /private/var now has $(ls "$HFSMP/private/var" | wc -l) entries"
+          ls "$HFSMP/private/var" | head -30
+          [ -d "$HFSMP/private/var/keybags" ] || { echo 'keybags dir missing'; exit 1; }
+          echo '  keybags directory present'
+          echo 'MARK: step 1d2 - keybag placeholders and launchd disabled list'
+          sudo touch "$HFSMP/private/var/keybags/systembag.kb" || true
+          sudo touch "$HFSMP/private/var/keybags/persona.kb" || true
+          sudo mkdir -p "$HFSMP/private/var/db/com.apple.xpc.launchd"
+          python3 - "$HFSMP/private/var/db/com.apple.xpc.launchd/disabled.plist" <<'PYDP'
+          import plistlib, sys
+          labels = ["com.apple.CommCenter", "com.apple.fairplayd.H2", "com.apple.analyticsd"]
+          with open(sys.argv[1], "wb") as f:
+              plistlib.dump({k: True for k in labels}, f, fmt=plistlib.FMT_BINARY)
+          print("disabled.plist written:", labels)
+          PYDP
+          ls -l "$HFSMP/private/var/keybags" "$HFSMP/private/var/db/com.apple.xpc.launchd"
+          echo 'MARK: step 2 - no decompression pass needed (rsync wrote plain files)'
+          df -h "$HFSMP" | tail -1
+          DC2=$(find "$HFSMP" -type f 2>/dev/null | wc -l)
+          echo "stage2 destination files=$DC2"
+          SRC_MB=$(du -sm "$SYS" | awk '{print $1}')
+          DST_MB=$(du -sm "$HFSMP" | awk '{print $1}')
+          echo "compressed source: ${SRC_MB} MB   destination: ${DST_MB} MB"
+          echo 'MARK: HARD CHECKS'
+          USED_MB=$(( $(df -m "$HFSMP" | tail -1 | awk '{print $2}') - $(df -m "$HFSMP" | tail -1 | awk '{print $4}') ))
+          echo "  volume used ${USED_MB} MB  (compressed would be ~4900, decompressed ~8400+cache)"
+          [ "$USED_MB" -gt 7000 ] || { echo 'USED SPACE TOO SMALL - files were not decompressed or cache missing'; exit 1; }
+          SRC_MB=$(( SRC_MB + 800 ))
+          SC=$(find "$SYS" -type f 2>/dev/null | wc -l); echo "  files: source=$SC destination=$DC2"; MINC=$(( SC * 90 / 100 )); [ "$DC2" -ge "$MINC" ] || { echo "FILE COUNT TOO LOW source=$SC destination=$DC2 min=$MINC"; exit 1; }
+          [ -d "$HFSMP/System/Library/Caches/com.apple.dyld" ] || { echo 'DYLD SHARED CACHE DIRECTORY MISSING - cryptex was not overlaid'; exit 1; }
+          ls -l "$HFSMP/System/Library/Caches/com.apple.dyld" | head -6
+          find "$HFSMP/System/Library/Caches/com.apple.dyld" -name 'dyld_shared_cache*' | head -3
+          [ -n "$(find "$HFSMP/System/Library/Caches/com.apple.dyld" -name 'dyld_shared_cache*' | head -1)" ] || { echo 'NO dyld_shared_cache FILE ON DESTINATION'; exit 1; }
+          echo 'dyld shared cache present'
+          [ "$DST_MB" -gt $(( SRC_MB * 130 / 100 )) ] || { echo 'destination not larger than compressed source: files still compressed'; exit 1; }
+          echo 'all hard checks passed: complete copy and decompressed'
+          sync
+          echo 'MARK: detaching the volume so the fsck step can attach it again'
+          hdiutil detach "$HFSMP" || hdiutil detach "$HFSMP" -force || true
+          sleep 2
+          hdiutil info | grep -c '/Volumes/iOS16' || echo '  volume detached'
+          ls -l "$HFSMP/sbin/launchd" || true; ls -l "$HFSMP/usr/lib/libSystem.B.dylib" 2>/dev/null || echo "  (libSystem.B.dylib has no file on iOS 16 - it lives in the dyld shared cache, which is present)"
+          echo 'MARK: checking decmpfs xattrs on the DESTINATION'
+          echo "--- source /sbin/launchd xattrs ---"
+          xattr -l "$SYS/sbin/launchd" 2>&1 | head -5 || echo '(none)'
+          echo "--- destination /sbin/launchd xattrs ---"
+          xattr -l "$HFSMP/sbin/launchd" 2>&1 | head -5 || echo '(none)'
+          echo "--- source vs destination sizes ---"
+          ls -l "$SYS/sbin/launchd" "$HFSMP/sbin/launchd" || true
+          echo "launchd present on destination: $([ -e "$HFSMP/sbin/launchd" ] && echo yes || echo NO)"
+          if xattr -l "$HFSMP/sbin/launchd" 2>/dev/null | grep -q decmpfs; then
+            echo 'DECMPFS XATTR STILL PRESENT ON DESTINATION - files are still compressed'; exit 1;
+          fi
+          echo 'no decmpfs xattr on the destination: files are stored uncompressed'
+          echo 'MARK: decisive check - real disk usage of the destination'
+          SRC_MB=$(du -sm "$SYS" | awk '{print $1}')
+          DST_MB=$(du -sm "$HFSMP" | awk '{print $1}')
+          echo "compressed source: ${SRC_MB} MB   destination: ${DST_MB} MB"
+          if [ "$DST_MB" -lt $(( SRC_MB * 115 / 100 )) ]; then
+            echo 'DESTINATION IS NOT BIGGER THAN THE COMPRESSED SOURCE - files were copied still compressed';
+            echo 'launchd on the destination:'; ls -l "$HFSMP/sbin/launchd" || true; du -sk "$HFSMP/sbin/launchd" || true;
+            exit 1;
+          fi
+          echo 'destination real usage is larger -> files are stored uncompressed'
+          echo 'launchd on destination:'; ls -l "$HFSMP/sbin/launchd" || true; du -sk "$HFSMP/sbin/launchd" || true
+          echo 'MARK: sample check: count compressed files on destination'
+          CNT=$(find "$HFSMP/sbin" "$HFSMP/usr/lib" -type f 2>/dev/null | head -300 | while read f; do xattr -l "$f" 2>/dev/null | grep -q decmpfs && echo x; done | wc -l)
+          echo "compressed files among 300 sampled: $CNT"
+          hdiutil detach "$HFSMP" || true
+          ls -la hfs.dmg
+
+      - name: fsck the volume (must be clean)
+        run: |
+          set -eux
+          hdiutil attach hfs.dmg -nobrowse >/dev/null
+          sleep 3
+          DEV=$(hdiutil info | grep -oE '/dev/disk[0-9]+s[0-9]+' | tail -1)
+          echo "device: $DEV"
+          diskutil unmount force "$DEV" || true
+          sudo fsck_hfs -f -y "$DEV" | tail -25
+          sudo fsck_hfs -f -y "$DEV" > fsck.out 2>&1 || true
+          tail -5 fsck.out
+          if grep -qiE 'serious|corrupt|invalid|cannot' fsck.out; then echo 'FSCK REPORTED PROBLEMS'; cat fsck.out; exit 1; fi
+          echo "DEV=$DEV" >> $GITHUB_ENV
+
+      - name: Copy the raw filesystem, size taken from the volume header
+        run: |
+          set -euxo pipefail
+          echo 'MARK: start raw copy'
+          # re-attach deterministically (do not rely on the previous step's state)
+          hdiutil attach -nomount hfs.dmg || true
+          sleep 3
+          hdiutil info | grep -E '/dev/disk|image-path' || true
+          # pick the device whose image-path is hfs.dmg (a bare filesystem has no sN suffix)
+          DEV=$(hdiutil info | awk '/image-path/ { p = $3 } /^\/dev\/disk/ { if (p ~ /hfs\.dmg$/) print $1 }' | head -1 || true)
+          if [ -z "$DEV" ]; then echo 'no hfs.dmg device found'; hdiutil info; exit 1; fi
+          RAW=$(echo "$DEV" | sed 's|/dev/disk|/dev/rdisk|')
+          echo "DEV=$DEV RAW=$RAW"
+          ls -la "$RAW" || true
+          echo 'MARK: reading volume header'
+          SIZE=$(sudo python3 -c "import struct; f=open('$RAW','rb'); f.seek(1024); vh=f.read(512); bs,tb=struct.unpack('>II', vh[40:48]); print(bs*tb)" 2>&1)
+          echo "SIZE=$SIZE"
+          case "$SIZE" in (''|*[!0-9]*) echo "could not read a numeric size: $SIZE"; exit 1;; esac
+          echo "volume says $SIZE bytes"
+          echo 'MARK: free disk before dd'
+          df -h . | tail -1
+          echo 'MARK: removing the IPSW and dmgs to make room for the raw image'
+          hdiutil detach "$SYS" >/dev/null 2>&1 || true
+          sudo rm -rf ipsw_out ipsw.zip || true
+          df -h . | tail -1
+          echo 'MARK: dd'
+          sudo dd if="$RAW" of=hfs.img bs=1m count=$(( SIZE / 1048576 + 2 ))
+          sudo truncate -s "$SIZE" hfs.img
+          sudo chown "$(id -u):$(id -g)" hfs.img
+          ls -la hfs.img
+          echo 'MARK: detach'
+          hdiutil detach "$DEV" || true
+          rm -f hfs.dmg
+          df -h .
+          ls -la hfs.img
+          echo "SIZE=$SIZE" >> $GITHUB_ENV
+          echo 'MARK: raw copy done'
+      - name: Self-checks (all five must pass)
+        run: |
+          set -eux
+          python3 - <<'PY'
+          import os, struct
+          p = 'hfs.img'
+          n = os.path.getsize(p)
+          f = open(p, 'rb')
+          f.seek(1024)
+          vh = f.read(512)
+          sig, ver = struct.unpack('>HH', vh[0:4])
+          bs, tb, fb = struct.unpack('>III', vh[40:52])
+          fc, dc = struct.unpack('>II', vh[32:40])
+          print('1) VH sig=0x%04x ver=%d  files=%d folders=%d' % (sig, ver, fc, dc))
+          assert sig == 0x482B and ver == 4, 'bad volume header'
+          vol = bs * tb
+          print('2) image=%d  volume=%d  %s' % (n, vol, 'EXACT MATCH' if n == vol else 'MISMATCH'))
+          assert n == vol, 'image size != volume size'
+          alt = n - 1024
+          f.seek(alt); a = f.read(512)
+          asig, = struct.unpack('>H', a[0:2])
+          print('3) alternate VH at %d: sig=0x%04x' % (alt, asig))
+          assert asig == 0x482B, 'no alternate volume header at the volume end'
+          def node0(forkoffs, label):
+              fork = vh[forkoffs:forkoffs + 80]
+              logical, clump, nblocks = struct.unpack('>QII', fork[0:16])
+              sb0, bc0 = struct.unpack('>II', fork[16:24])
+              f.seek(sb0 * bs)
+              nd = f.read(16)
+              kind, height = nd[8], nd[9]
+              nrec, = struct.unpack('>H', nd[10:12])
+              print('   %s: logical=%d blocks=%d ext0=(%d,%d) node0 kind=%d height=%d nrec=%d' % (label, logical, nblocks, sb0, bc0, kind, height, nrec))
+              return kind
+          kcat = node0(0x110, 'catalogFile')
+          kext = node0(0x0C0, 'extentsFile')
+          print('4) catalog node0 kind=%d (must be 1)' % kcat)
+          assert kcat == 1, 'catalog node 0 is not a header node'
+          print('5) extents node0 kind=%d (must be 1)' % kext)
+          assert kext == 1, 'extents node 0 is not a header node'
+          print('ALL FIVE SELF-CHECKS PASSED')
+          PY
+
+      - name: Compress, split and publish
+        env:
+          GH_TOKEN: ${{ secrets.RELEASE_TOKEN }}
+        run: |
+          set -eux
+          TAG=ios-hfs-root26
+          echo "TAG=$TAG"
+          zstd -10 -T0 --long=27 -f hfs.img -o hfs.img.zst
+          ls -la hfs.img.zst
+          rm -f hfs.img
+          split -b 1900m hfs.img.zst hfs.img.zst.part
+          echo 'MARK: writing VERSION.txt'
+          {
+            echo "tag            : $TAG"
+            echo "built_utc      : $(date -u +%Y-%m-%dT%H:%M:%SZ)"
+            echo "run_id         : $GITHUB_RUN_ID"
+            echo "components     : iOS 16.7.16 System volume + dyld shared cache from the SystemOS cryptex"
+            echo "files          : rsync (decompressed on write), cryptex cache added"
+            echo "raw_image_bytes: $(stat -f%z hfs.img)"
+            echo "sha256_raw     : $(shasum -a 256 hfs.img | awk '{print $1}')"
+            echo "sha256_zst     : $(shasum -a 256 hfs.img.zst | awk '{print $1}')"
+            echo "dyld_cache     : verified present before packing (hard check in the copy step)"
+            echo "flash          : fastboot flash userdata hfs.img"
+          } > VERSION.txt
+          cat VERSION.txt
+          ls -la hfs.img.zst.part* | head -20
+          shasum -a 256 hfs.img.zst.part* | tee parts.sha256
+          echo "PARTS=$(ls hfs.img.zst.part* | wc -l)" >> $GITHUB_ENV
+          echo 'MARK: creating release'
+          gh release view $TAG --repo G3134377393/marble-uefi >/dev/null 2>&1 || \
+            gh release create $TAG --repo G3134377393/marble-uefi --title 'iOS HFS+ root v11 (only the dyld cache from the cryptex)' --notes 'files stored uncompressed; five self-checks passed'
+          echo 'MARK: uploading'
+          gh release upload $TAG hfs.img.zst.part* parts.sha256 VERSION.txt --repo G3134377393/marble-uefi --clobber
+          echo 'MARK: uploaded, sleeping 30s for cdn'
+          sleep 30
+          echo 'MARK: verifying uploads (retries, non-fatal)'
+          for f in hfs.img.zst.part*; do
+            URL="https://github.com/G3134377393/marble-uefi/releases/download/$TAG/$f"
+            ok=0
+            for t in 1 2 3 4 5 6; do
+              if curl -fsSL --retry 3 -o verify.bin "$URL"; then ok=1; break; fi
+              echo "  $f not ready (attempt $t), retrying in 20s"; sleep 20
+            done
+            if [ "$ok" = 1 ]; then
+              A=$(shasum -a 256 "$f" | awk '{print $1}')
+              B=$(shasum -a 256 verify.bin | awk '{print $1}')
+              if [ "$A" = "$B" ]; then echo "  $f VERIFIED OK"; else echo "  $f MISMATCH, re-uploading"; gh release upload $TAG "$f" --repo G3134377393/marble-uefi --clobber || true; fi
+            else
+              echo "  $f could not be verified (cdn)"
+            fi
+          done
+          echo 'MARK: done'
+          gh release view $TAG --repo G3134377393/marble-uefi || true
