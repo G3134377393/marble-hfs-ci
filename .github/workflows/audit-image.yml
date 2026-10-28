@@ -1,0 +1,66 @@
+name: audit-image
+
+on:
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: release tag to audit
+        default: ios-hfs-root27
+
+permissions:
+  contents: read
+
+jobs:
+  audit:
+    runs-on: macos-14
+    timeout-minutes: 60
+    steps:
+      - name: Download parts
+        env:
+          TOK: ${{ secrets.RELEASE_TOKEN }}
+        run: |
+          set -eux
+          TAG="${{ inputs.tag }}"
+          API=https://api.github.com
+          REPO=G3134377393/marble-uefi
+          mkdir -p parts && cd parts
+          curl -sS -H "Authorization: token $TOK" "$API/repos/$REPO/releases/tags/$TAG" -o rel.json
+          python3 - <<'PY'
+          import json, os, subprocess
+          rel = json.load(open('rel.json'))
+          for a in rel['assets']:
+              if a['name'].startswith('hfs.img.zst.part'):
+                  url = 'https://api.github.com/repos/G3134377393/marble-uefi/releases/assets/%d' % a['id']
+                  subprocess.run(['curl','-sS','-fL','--retry','8','--retry-all-errors','-H','Authorization: token '+os.environ['TOK'],'-H','Accept: application/octet-stream','-o',a['name'],url], check=True)
+                  print('got', a['name'], os.path.getsize(a['name']))
+          PY
+      - name: Reassemble and decompress
+        run: |
+          set -eux
+          cd parts
+          cat hfs.img.zst.parta* > hfs.img.zst
+          ls -l hfs.img.zst
+          brew install zstd || true
+          zstd -d -f hfs.img.zst -o hfs.img
+          ls -l hfs.img
+      - name: Mount and write the manifest
+        run: |
+          set -eux
+          cd parts
+          MP=$(hdiutil attach hfs.img -nobrowse -readonly | grep -o '/Volumes/.*' | head -1)
+          echo "mounted at $MP"
+          ( cd "$MP" && find . -mindepth 1 | sed 's|^\./||' | sort ) > manifest.txt
+          wc -l manifest.txt
+          ( cd "$MP" && find . -mindepth 1 -type f | wc -l ) > counts.txt
+          echo "files: $(cat counts.txt)" >> counts.txt
+          echo "PreferenceBundles: $(ls "$MP/System/Library/PreferenceBundles" 2>/dev/null | wc -l)" >> counts.txt
+          echo "Extensions: $(ls "$MP/System/Library/Extensions" 2>/dev/null | wc -l)" >> counts.txt
+          echo "Filesystems: $(ls "$MP/System/Library/Filesystems" 2>/dev/null | wc -l)" >> counts.txt
+          cat counts.txt
+          hdiutil detach "$MP" || true
+      - uses: actions/upload-artifact@v4
+        with:
+          name: image-manifest
+          path: |
+            parts/manifest.txt
+            parts/counts.txt
