@@ -1,0 +1,15 @@
+name: xcode-probe
+on: workflow_dispatch
+jobs:
+  p:
+    runs-on: macos-15
+    steps:
+      - run: |
+          echo "=== /Applications ==="
+          ls /Applications | grep -i xcode || true
+          echo "=== xcode-select ==="
+          xcode-select -p || true
+          echo "=== xcodebuild ==="
+          xcodebuild -version || true
+          echo "=== iig? ==="
+          find /Applications -name iig -maxdepth 6 2>/dev/null | head -5
