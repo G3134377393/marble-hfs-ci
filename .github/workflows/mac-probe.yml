@@ -1,0 +1,15 @@
+name: mac-probe
+on: workflow_dispatch
+jobs:
+  m14:
+    runs-on: macos-14
+    steps:
+      - run: echo macos14 ok
+  m15:
+    runs-on: macos-15
+    steps:
+      - run: echo macos15 ok
+  m13:
+    runs-on: macos-13
+    steps:
+      - run: echo macos13 ok
